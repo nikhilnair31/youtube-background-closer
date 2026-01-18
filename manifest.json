@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Background Auto-Close",
+  "version": "1.0",
+  "description": "Closes background YT tabs when finished and refreshes the next tab.",
+  "permissions": ["tabs", "scripting"],
+  "host_permissions": ["https://www.youtube.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"]
+    }
+  ]
+}
