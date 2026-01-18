@@ -1,97 +1,101 @@
 // background.js
 
-// Function to handle moving to the next tab without closing the current one
-async function activateNextTab(currentTabId, windowId) {
+async function getNextTab(currentTabId, windowId) {
+  const tabs = await chrome.tabs.query({ windowId });
+  tabs.sort((a, b) => a.index - b.index);
+
+  const currentIndex = tabs.findIndex((t) => t.id === currentTabId);
+  if (currentIndex === -1) return tabs[0];
+
+  return currentIndex < tabs.length - 1 ? tabs[currentIndex + 1] : tabs[0];
+}
+
+async function activateAndRefreshTab(tabId) {
+  if (!tabId) return;
+
   try {
-    const tabs = await chrome.tabs.query({ windowId: windowId });
-    tabs.sort((a, b) => a.index - b.index);
+    // 1. Activate the tab first
+    await chrome.tabs.update(tabId, { active: true });
+    
+    // Give a tiny moment for focus to shift
+    await new Promise((r) => setTimeout(r, 100));
 
-    // If we are skipping (keeping tab open), find the next index
-    if (currentTabId) {
-       const currentIndex = tabs.findIndex(t => t.id === currentTabId);
-       let nextTab = null;
+    // 2. Get current state
+    const tab = await chrome.tabs.get(tabId);
+    console.log(`Checking tab: ${tab.url}`);
 
-       // If not at the end, go right
-       if (currentIndex !== -1 && currentIndex < tabs.length - 1) {
-         nextTab = tabs[currentIndex + 1];
-       } 
-       // If at the end, go to 0
-       else if (tabs.length > 0) {
-         nextTab = tabs[0];
-       }
+    // 3. Check for Marvelous Suspender (or generic suspension)
+    if (tab.url.includes('chrome-extension://') && tab.url.includes('uri=')) {
+      console.log('Tab is Suspended. Extracting real URL...');
 
-       if (nextTab) {
-         await chrome.tabs.update(nextTab.id, { active: true });
-         setTimeout(() => chrome.tabs.reload(nextTab.id), 200);
-         console.log(`Switched to and refreshing: ${nextTab.title}`);
-       }
+      // Extract the 'uri' parameter from the suspended URL
+      const urlParams = new URLSearchParams(tab.url.split('#')[1]); // usually after hash
+      let originalUrl = urlParams.get('uri');
+      
+      if (!originalUrl) {
+         // Fallback if params are in search instead of hash
+         const searchParams = new URL(tab.url).searchParams;
+         originalUrl = searchParams.get('uri');
+      }
+
+      if (originalUrl) {
+        console.log(`Restoring to original URL: ${originalUrl}`);
+        await chrome.tabs.update(tabId, { url: originalUrl });
+        return; // We don't need to reload, updating URL does it
+      }
     }
+
+    // 4. Standard Reload (for non-suspended or native discarded tabs)
+    // We force bypass cache to ensure the content script runs fresh
+    console.log('Standard reload triggered.');
+    await chrome.tabs.reload(tabId, { bypassCache: true });
+
   } catch (error) {
-    console.error('Error activating next tab:', error);
+    console.error('Failed to activate/reload tab:', error);
   }
 }
 
-chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener(async (message, sender) => {
   if (!sender.tab) return;
 
   const tabId = sender.tab.id;
   const windowId = sender.tab.windowId;
 
   try {
-    const tab = await chrome.tabs.get(tabId);
-    const window = await chrome.windows.get(windowId);
+    const [tab, window] = await Promise.all([
+      chrome.tabs.get(tabId),
+      chrome.windows.get(windowId),
+    ]);
 
-    // --- SAFETY CHECK (UPDATED) ---
-    
-    // We only care if the window is Minimized or if the Tab is Hidden (background tab).
-    // We DO NOT check window.focused. This allows the window to be visible 
-    // on a second monitor (or behind another small window) without triggering the close.
-    
     const isWindowVisible = window.state !== 'minimized';
     const isTabActive = tab.active;
 
-    // If the window is on screen (not minimized) AND this is the tab currently showing:
-    // ABORT. Let YouTube autoplay handle it.
+    // Safety Check: If visible and active, let YouTube handle it
     if (isWindowVisible && isTabActive) {
-      console.log('Window visible & tab active. Ignoring script. Letting Autoplay work.');
+      console.log('Window visible & tab active. Letting autoplay work.');
       return;
     }
 
-    // --- EXECUTION LOGIC ---
-
     if (message.action === 'videoEnded') {
-      // 1. Determine who is next BEFORE closing
-      const tabs = await chrome.tabs.query({ windowId: windowId });
-      tabs.sort((a, b) => a.index - b.index);
-      const currentIndex = tabs.findIndex(t => t.id === tabId);
-      
-      let nextTabId = null;
-      
-      // Calculate next tab ID
-      if (currentIndex !== -1 && currentIndex < tabs.length - 1) {
-        nextTabId = tabs[currentIndex + 1].id;
-      } else if (tabs.length > 0) {
-        nextTabId = tabs[0].id;
-      }
+      const nextTab = await getNextTab(tabId, windowId);
+      const allTabs = await chrome.tabs.query({ windowId });
 
-      // 2. Close the completed video tab (only if we have more than 1 tab)
-      if (tabs.length > 1) {
+      if (allTabs.length > 1) {
+        // Close current tab
         await chrome.tabs.remove(tabId);
-        console.log('Video ended (Background/Minimized). Tab closed.');
+        console.log('Video ended. Tab closed.');
       }
 
-      // 3. Activate and reload the next tab
-      if (nextTabId) {
-        await chrome.tabs.update(nextTabId, { active: true });
-        // Small delay to ensure the close action settled
-        setTimeout(() => chrome.tabs.reload(nextTabId), 300);
+      if (nextTab) {
+        // Pass the ID to our logic
+        await activateAndRefreshTab(nextTab.id);
       }
-
     } else if (message.action === 'notAVideo') {
-      console.log('Not a video. Keeping tab open, moving to next.');
-      await activateNextTab(tabId, windowId);
+      const nextTab = await getNextTab(tabId, windowId);
+      if (nextTab) {
+        await activateAndRefreshTab(nextTab.id);
+      }
     }
-
   } catch (error) {
     console.error('Error in background script:', error);
   }
